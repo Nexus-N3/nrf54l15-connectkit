@@ -6,6 +6,8 @@
  */
 
 #include <zephyr/types.h>
+#include <zephyr/kernel.h>
+#include "bridge_stats.h"
 #include <zephyr/sys/ring_buffer.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/pm/device.h>
@@ -33,6 +35,9 @@ static const struct device *devices[] = {
 #define UART_SLAB_BLOCK_COUNT (UART_DEVICE_COUNT * CONFIG_IFMCU_UART_BUF_COUNT)
 #define UART_SLAB_ALIGNMENT 4
 #define UART_RX_TIMEOUT_USEC 1000
+#define UART_RX_RECOVERY_DELAY_MS 25
+/* This IFMCU firmware defines a single physical UART bridge. */
+BUILD_ASSERT(UART_DEVICE_COUNT == 1, "Recovery work is single-UART");
 
 #if defined(CONFIG_PM_DEVICE)
 #define UART_SET_PM_STATE true
@@ -62,14 +67,50 @@ static struct uart_tx_buf uart_tx_ringbufs[UART_DEVICE_COUNT];
 static uint32_t uart_default_baudrate[UART_DEVICE_COUNT];
 /* UART RX only enabled when there is one or more subscribers (power saving) */
 static int subscriber_count[UART_DEVICE_COUNT];
-static bool enable_rx_retry[UART_DEVICE_COUNT];
+/* A stopped receiver is restarted from a work item, not the UART callback. */
+static atomic_t uart_rx_recovery_pending;
 static atomic_t uart_tx_started[UART_DEVICE_COUNT];
 
-static void enable_uart_rx(uint8_t dev_idx);
+static int enable_uart_rx(uint8_t dev_idx);
 static void disable_uart_rx(uint8_t dev_idx);
 static void set_uart_power_state(uint8_t dev_idx, bool active);
 static int uart_tx_start(uint8_t dev_idx);
 static void uart_tx_finish(uint8_t dev_idx, size_t len);
+
+static void uart_rx_recovery_work_handler(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(uart_rx_recovery_work, uart_rx_recovery_work_handler);
+
+static void schedule_uart_rx_recovery(void)
+{
+	atomic_set(&uart_rx_recovery_pending, 1);
+	(void)k_work_reschedule(&uart_rx_recovery_work,
+				K_MSEC(UART_RX_RECOVERY_DELAY_MS));
+}
+
+static void uart_rx_recovery_work_handler(struct k_work *work)
+{
+	int err;
+
+	ARG_UNUSED(work);
+	if (subscriber_count[0] <= 0 || !atomic_get(&uart_rx_recovery_pending)) {
+		return;
+	}
+
+	atomic_inc(&g_bridge_stats.uart_rx_recovery_attempts);
+	/* Clear before enabling so a new STOPPED callback is not lost. */
+	atomic_set(&uart_rx_recovery_pending, 0);
+	err = enable_uart_rx(0);
+	if (err == 0) {
+		atomic_inc(&g_bridge_stats.uart_rx_recovery_success);
+	} else {
+		atomic_set(&uart_rx_recovery_pending, 1);
+		atomic_inc(&g_bridge_stats.uart_rx_recovery_failures);
+		atomic_set(&g_bridge_stats.uart_rx_recovery_last_error, err);
+		/* RX may still be disabling, or all RX slab blocks may be in use. */
+		(void)k_work_reschedule(&uart_rx_recovery_work,
+				K_MSEC(UART_RX_RECOVERY_DELAY_MS));
+	}
+}
 
 static inline struct uart_rx_buf *block_start_get(uint8_t *buf)
 {
@@ -96,9 +137,11 @@ static struct uart_rx_buf *uart_rx_buf_alloc(void)
 
 	err = k_mem_slab_alloc(&uart_rx_slab, (void **) &buf, K_NO_WAIT);
 	if (err) {
+		atomic_inc(&g_bridge_stats.uart_rx_buf_alloc_fails);
 		return NULL;
 	}
 
+	atomic_inc(&g_bridge_stats.uart_rx_buf_allocs);
 	atomic_set(&buf->ref_counter, 1);
 
 	return buf;
@@ -120,6 +163,7 @@ static void uart_rx_buf_unref(void *buf)
 
 	/* ref_counter is the uart_buf->ref_counter value prior to decrement */
 	if (ref_counter == 1) {
+		atomic_inc(&g_bridge_stats.uart_rx_buf_frees);
 		k_mem_slab_free(&uart_rx_slab, (void *)uart_buf);
 	}
 }
@@ -134,6 +178,9 @@ static void uart_callback(const struct device *dev, struct uart_event *evt,
 
 	switch (evt->type) {
 	case UART_RX_RDY:
+		atomic_inc(&g_bridge_stats.uart_rx_events);
+		atomic_add(&g_bridge_stats.uart_rx_bytes, (atomic_val_t)evt->data.rx.len);
+		atomic_set(&g_bridge_stats.uart_rx_last_ms, (atomic_val_t)k_uptime_get_32());
 		uart_rx_buf_ref(evt->data.rx.buf);
 
 		event = new_uart_data_event();
@@ -156,14 +203,16 @@ static void uart_callback(const struct device *dev, struct uart_event *evt,
 
 		err = uart_rx_buf_rsp(dev, buf->buf, sizeof(buf->buf));
 		if (err) {
+			atomic_inc(&g_bridge_stats.uart_rx_buf_rsp_fails);
 			LOG_ERR("uart_rx_buf_rsp: %d", err);
 			uart_rx_buf_unref(buf);
 		}
 		break;
 	case UART_RX_DISABLED:
-		if (enable_rx_retry[dev_idx]) {
-			enable_uart_rx(dev_idx);
-			enable_rx_retry[dev_idx] = false;
+		atomic_inc(&g_bridge_stats.uart_rx_disabled);
+		/* The bridge must remain receptive while the host is connected. */
+		if (subscriber_count[dev_idx] > 0) {
+			schedule_uart_rx_recovery();
 		} else if (UART_SET_PM_STATE) {
 			set_uart_power_state(dev_idx, false);
 		}
@@ -178,18 +227,22 @@ static void uart_callback(const struct device *dev, struct uart_event *evt,
 		}
 		break;
 	case UART_TX_ABORTED:
+		atomic_inc(&g_bridge_stats.uart_tx_aborted);
 		uart_tx_finish(dev_idx, evt->data.tx.len);
 		atomic_set(&uart_tx_started[dev_idx], false);
 		break;
 	case UART_RX_STOPPED:
+		atomic_inc(&g_bridge_stats.uart_rx_stopped);
+		atomic_set(&g_bridge_stats.uart_rx_stop_reason, (atomic_val_t)evt->data.rx_stop.reason);
 		LOG_WRN("UART_%d stop reason %d", dev_idx, evt->data.rx_stop.reason);
 
 		/* Retry automatically in case of unexpected stop.
 		 * Typically happens when the peer does not drive its TX GPIO,
 		 * or if there is a baud rate mismatch.
 		 */
-		if (IS_ENABLED(CONFIG_UART_NRFX_UARTE_LEGACY_SHIM)) {
-			enable_rx_retry[dev_idx] = true;
+		/* Framing errors can stop async RX even while DTR stays asserted. */
+		if (subscriber_count[dev_idx] > 0) {
+			schedule_uart_rx_recovery();
 		}
 		break;
 	default:
@@ -244,7 +297,7 @@ static void set_uart_power_state(uint8_t dev_idx, bool active)
 #endif
 }
 
-static void enable_uart_rx(uint8_t dev_idx)
+static int enable_uart_rx(uint8_t dev_idx)
 {
 	const struct device *dev = devices[dev_idx];
 	int err;
@@ -252,22 +305,26 @@ static void enable_uart_rx(uint8_t dev_idx)
 
 	err = uart_callback_set(dev, uart_callback, (void *) (int) dev_idx);
 	if (err) {
+		atomic_inc(&g_bridge_stats.uart_rx_enable_fails);
 		LOG_ERR("uart_callback_set: %d", err);
-		return;
+		return err;
 	}
 
 	buf = uart_rx_buf_alloc();
 	if (!buf) {
 		LOG_ERR("uart_rx_buf_alloc error");
-		return;
+		return -ENOMEM;
 	}
 
 	err = uart_rx_enable(dev, buf->buf, sizeof(buf->buf), UART_RX_TIMEOUT_USEC);
 	if (err) {
+		atomic_inc(&g_bridge_stats.uart_rx_enable_fails);
 		uart_rx_buf_unref(buf);
 		LOG_ERR("uart_rx_enable: %d", err);
-		return;
+		return err;
 	}
+	atomic_inc(&g_bridge_stats.uart_rx_enable_ok);
+	return 0;
 }
 
 static void disable_uart_rx(uint8_t dev_idx)
@@ -295,6 +352,7 @@ static int uart_tx_start(uint8_t dev_idx)
 
 	err = uart_tx(devices[dev_idx], buf, len, 0);
 	if (err) {
+		atomic_inc(&g_bridge_stats.uart_tx_start_fails);
 		LOG_ERR("uart_tx: %d", err);
 		uart_tx_finish(dev_idx, 0);
 		return err;
@@ -320,6 +378,8 @@ static int uart_tx_enqueue(uint8_t *data, size_t data_len, uint8_t dev_idx)
 	int err;
 
 	written = ring_buf_put(&uart_tx_ringbufs[dev_idx].rb, data, data_len);
+	atomic_add(&g_bridge_stats.uart_tx_enqueued_bytes, (atomic_val_t)written);
+	atomic_add(&g_bridge_stats.uart_tx_dropped_bytes, (atomic_val_t)(data_len - written));
 	if (written == 0) {
 		return -ENOMEM;
 	}
@@ -351,6 +411,7 @@ static bool app_event_handler(const struct app_event_header *aeh)
 			cast_uart_data_event(aeh);
 
 		set_uart_led_state(LED_STATE_BLINK);
+		atomic_inc(&g_bridge_stats.uart_rx_events_consumed);
 
 		/* All subscribers have gotten a chance to copy data at this point */
 		uart_rx_buf_unref(event->buf);
@@ -414,6 +475,8 @@ static bool app_event_handler(const struct app_event_header *aeh)
 		__ASSERT_NO_MSG(subscriber_count[event->dev_idx] >= 0);
 
 		if (subscriber_count[event->dev_idx] == 0) {
+			atomic_set(&uart_rx_recovery_pending, 0);
+			(void)k_work_cancel_delayable(&uart_rx_recovery_work);
 			LOG_DBG("No subscribers. Close UART_%d RX", event->dev_idx);
 			set_uart_baudrate(
 				event->dev_idx,
@@ -424,7 +487,12 @@ static bool app_event_handler(const struct app_event_header *aeh)
 			if (UART_SET_PM_STATE) {
 				set_uart_power_state(event->dev_idx, true);
 			}
-			enable_uart_rx(event->dev_idx);
+			atomic_set(&uart_rx_recovery_pending, 0);
+			(void)k_work_cancel_delayable(&uart_rx_recovery_work);
+			err = enable_uart_rx(event->dev_idx);
+			if (err) {
+				schedule_uart_rx_recovery();
+			}
 		} else {
 			return false;
 		}
@@ -453,7 +521,7 @@ static bool app_event_handler(const struct app_event_header *aeh)
 				}
 				uart_default_baudrate[i] = cfg.baudrate;
 				subscriber_count[i] = 0;
-				enable_rx_retry[i] = false;
+				atomic_set(&uart_rx_recovery_pending, 0);
 
 				atomic_set(&uart_tx_started[i], false);
 

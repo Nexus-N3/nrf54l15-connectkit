@@ -8,6 +8,8 @@
 target_sources_ifdef(CONFIG_POWEROFF
 		     app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/power_handler.c)
 
+target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bridge_stats.c)
+
 target_sources_ifdef(CONFIG_SERIAL
 		     app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/uart_handler.c)
 

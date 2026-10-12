@@ -6,6 +6,8 @@
  */
 #include <stdio.h>
 #include <zephyr/types.h>
+#include <zephyr/kernel.h>
+#include "bridge_stats.h"
 #include <zephyr/drivers/uart.h>
 #include <zephyr/usb/usb_device.h>
 
@@ -84,6 +86,7 @@ static void poll_dtr(void)
 			APP_EVENT_SUBMIT(event);
 
 			cdc_ready[i] = cdc_val;
+			atomic_set(&g_bridge_stats.cdc_dtr, cdc_val ? 1 : 0);
 			cdc_baudrate[i] = baudrate;
 		}
 	}
@@ -117,6 +120,9 @@ static void cdc_uart_interrupt_handler(const struct device *dev, void *user_data
 					dev,
 					overflow_buf,
 					sizeof(overflow_buf));
+				if (data_length > 0) {
+					atomic_add(&g_bridge_stats.cdc_host_rx_overflow_bytes, data_length);
+				}
 				LOG_WRN("CDC_%d RX overflow", dev_idx);
 			} while (data_length == sizeof(overflow_buf));
 			return;
@@ -131,6 +137,8 @@ static void cdc_uart_interrupt_handler(const struct device *dev, void *user_data
 			k_mem_slab_free(&cdc_rx_slab, rx_buf);
 			return;
 		}
+		atomic_inc(&g_bridge_stats.cdc_host_rx_events);
+		atomic_add(&g_bridge_stats.cdc_host_rx_bytes, data_length);
 
 		struct cdc_data_event *event = new_cdc_data_event();
 
@@ -155,9 +163,11 @@ static void usbd_status(enum usb_dc_status_code cb_status, const uint8_t *param)
 {
 	switch (cb_status) {
 	case USB_DC_ERROR:
+		atomic_inc(&g_bridge_stats.usb_error_events);
 		LOG_ERR("USB_DC_ERROR");
 		break;
 	case USB_DC_RESET:
+		atomic_inc(&g_bridge_stats.usb_reset_events);
 		LOG_DBG("USB_DC_RESET");
 		break;
 	case USB_DC_CONNECTED:
@@ -168,6 +178,7 @@ static void usbd_status(enum usb_dc_status_code cb_status, const uint8_t *param)
 		LOG_DBG("USB_DC_CONFIGURED");
 		break;
 	case USB_DC_DISCONNECTED:
+		atomic_inc(&g_bridge_stats.usb_disconnect_events);
 		LOG_DBG("USB_DC_DISCONNECTED");
 		module_set_state(MODULE_STATE_STANDBY);
 		break;
@@ -193,7 +204,10 @@ static bool app_event_handler(const struct app_event_header *aeh)
 			return false;
 		}
 
+		atomic_inc(&g_bridge_stats.uart_to_cdc_events);
+		atomic_add(&g_bridge_stats.uart_to_cdc_requested_bytes, (atomic_val_t)event->len);
 		if (cdc_ready[event->dev_idx] == 0) {
+			atomic_add(&g_bridge_stats.uart_to_cdc_no_dtr_bytes, (atomic_val_t)event->len);
 			return false;
 		}
 
@@ -202,6 +216,15 @@ static bool app_event_handler(const struct app_event_header *aeh)
 			event->buf,
 			event->len);
 
+		/* Do not change the forwarding behaviour in this diagnostic patch. */
+		if (tx_written > 0) {
+			atomic_add(&g_bridge_stats.uart_to_cdc_written_bytes, (atomic_val_t)tx_written);
+			atomic_set(&g_bridge_stats.uart_to_cdc_last_ms, (atomic_val_t)k_uptime_get_32());
+		}
+		if (tx_written < (int)event->len) {
+			int dropped = (int)event->len - (tx_written > 0 ? tx_written : 0);
+			atomic_add(&g_bridge_stats.uart_to_cdc_dropped_bytes, dropped);
+		}
 		if (tx_written != event->len) {
 			LOG_DBG("UART_%d->CDC_%d overflow",
 				event->dev_idx,
