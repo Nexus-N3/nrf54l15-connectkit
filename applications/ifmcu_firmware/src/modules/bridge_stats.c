@@ -45,6 +45,27 @@ static int cmd_bridge_stats(const struct shell *sh, size_t argc, char **argv)
     shell_print(sh, "usb errors=%u resets=%u disconnects=%u",
                 VALUE(usb_error_events), VALUE(usb_reset_events),
                 VALUE(usb_disconnect_events));
+    shell_print(sh, "uart_baud actual=%u requested=%u previous=%u changes=%u last_change_ms=%u",
+                VALUE(uart_baud_actual), VALUE(uart_baud_last_requested),
+                VALUE(uart_baud_previous), VALUE(uart_baud_changes),
+                VALUE(uart_baud_last_change_ms));
+    shell_print(sh, "uart_baud_config attempts=%u last_attempt_ms=%u in_progress=%u failures=%u",
+                VALUE(uart_baud_config_attempts), VALUE(uart_baud_last_attempt_ms),
+                VALUE(uart_baud_config_in_progress), VALUE(uart_baud_config_failures));
+    shell_print(sh, "cdc_line baud=%u baud_changes=%u baud_last_ms=%u dtr_changes=%u dtr_last_ms=%u",
+                VALUE(cdc_line_baud), VALUE(cdc_line_baud_changes),
+                VALUE(cdc_line_baud_last_change_ms), VALUE(cdc_dtr_changes),
+                VALUE(cdc_dtr_last_change_ms));
+    shell_print(sh, "uart_fault at_ms=%u last_rx_ms=%u rx_bytes=%u uart_baud=%u cdc_baud=%u dtr=%u",
+                VALUE(uart_fault_ms), VALUE(uart_fault_last_rx_ms),
+                VALUE(uart_fault_rx_bytes), VALUE(uart_fault_uart_baud),
+                VALUE(uart_fault_cdc_baud), VALUE(uart_fault_dtr));
+    shell_print(sh, "uart_fault_context uart_baud_change_ms=%u baud_attempt_ms=%u baud_config_in_progress=%u cdc_baud_change_ms=%u dtr_change_ms=%u",
+                VALUE(uart_fault_uart_change_ms), VALUE(uart_fault_baud_attempt_ms),
+                VALUE(uart_fault_baud_config_in_progress),
+                VALUE(uart_fault_cdc_baud_change_ms), VALUE(uart_fault_dtr_change_ms));
+    shell_print(sh, "uart_recovery last_success_ms=%u",
+                VALUE(uart_recovery_last_success_ms));
     return 0;
 }
 

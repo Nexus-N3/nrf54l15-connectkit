@@ -34,7 +34,7 @@ static const struct device *devices[] = {
 #define UART_SLAB_BLOCK_SIZE sizeof(struct uart_rx_buf)
 #define UART_SLAB_BLOCK_COUNT (UART_DEVICE_COUNT * CONFIG_IFMCU_UART_BUF_COUNT)
 #define UART_SLAB_ALIGNMENT 4
-#define UART_RX_TIMEOUT_USEC 1000
+#define UART_RX_TIMEOUT_USEC 5000
 #define UART_RX_RECOVERY_DELAY_MS 25
 /* This IFMCU firmware defines a single physical UART bridge. */
 BUILD_ASSERT(UART_DEVICE_COUNT == 1, "Recovery work is single-UART");
@@ -102,6 +102,7 @@ static void uart_rx_recovery_work_handler(struct k_work *work)
 	err = enable_uart_rx(0);
 	if (err == 0) {
 		atomic_inc(&g_bridge_stats.uart_rx_recovery_success);
+		atomic_set(&g_bridge_stats.uart_recovery_last_success_ms, k_uptime_get_32());
 	} else {
 		atomic_set(&uart_rx_recovery_pending, 1);
 		atomic_inc(&g_bridge_stats.uart_rx_recovery_failures);
@@ -234,6 +235,27 @@ static void uart_callback(const struct device *dev, struct uart_event *evt,
 	case UART_RX_STOPPED:
 		atomic_inc(&g_bridge_stats.uart_rx_stopped);
 		atomic_set(&g_bridge_stats.uart_rx_stop_reason, (atomic_val_t)evt->data.rx_stop.reason);
+		atomic_set(&g_bridge_stats.uart_fault_ms, k_uptime_get_32());
+		atomic_set(&g_bridge_stats.uart_fault_last_rx_ms,
+		           atomic_get(&g_bridge_stats.uart_rx_last_ms));
+		atomic_set(&g_bridge_stats.uart_fault_rx_bytes,
+		           atomic_get(&g_bridge_stats.uart_rx_bytes));
+		atomic_set(&g_bridge_stats.uart_fault_uart_baud,
+		           atomic_get(&g_bridge_stats.uart_baud_actual));
+		atomic_set(&g_bridge_stats.uart_fault_uart_change_ms,
+		           atomic_get(&g_bridge_stats.uart_baud_last_change_ms));
+		atomic_set(&g_bridge_stats.uart_fault_baud_attempt_ms,
+		           atomic_get(&g_bridge_stats.uart_baud_last_attempt_ms));
+		atomic_set(&g_bridge_stats.uart_fault_baud_config_in_progress,
+		           atomic_get(&g_bridge_stats.uart_baud_config_in_progress));
+		atomic_set(&g_bridge_stats.uart_fault_cdc_baud,
+		           atomic_get(&g_bridge_stats.cdc_line_baud));
+		atomic_set(&g_bridge_stats.uart_fault_cdc_baud_change_ms,
+		           atomic_get(&g_bridge_stats.cdc_line_baud_last_change_ms));
+		atomic_set(&g_bridge_stats.uart_fault_dtr,
+		           atomic_get(&g_bridge_stats.cdc_dtr));
+		atomic_set(&g_bridge_stats.uart_fault_dtr_change_ms,
+		           atomic_get(&g_bridge_stats.cdc_dtr_last_change_ms));
 		LOG_WRN("UART_%d stop reason %d", dev_idx, evt->data.rx_stop.reason);
 
 		/* Retry automatically in case of unexpected stop.
@@ -254,31 +276,44 @@ static void uart_callback(const struct device *dev, struct uart_event *evt,
 
 static void set_uart_baudrate(uint8_t dev_idx, uint32_t baudrate)
 {
-	const struct device *dev = devices[dev_idx];
-	struct uart_config cfg;
-	int err;
+    const struct device *dev = devices[dev_idx];
+    struct uart_config cfg;
+    uint32_t old_baudrate;
+    int err;
 
-	if (baudrate == 0) {
-		return;
-	}
+    if (baudrate == 0) {
+        return;
+    }
 
-	err = uart_config_get(dev, &cfg);
-	if (err) {
-		LOG_ERR("uart_config_get: %d", err);
-		return;
-	}
+    atomic_set(&g_bridge_stats.uart_baud_last_requested, baudrate);
+    err = uart_config_get(dev, &cfg);
+    if (err) {
+        LOG_ERR("uart_config_get: %d", err);
+        return;
+    }
 
-	if (cfg.baudrate == baudrate) {
-		return;
-	}
+    atomic_set(&g_bridge_stats.uart_baud_actual, cfg.baudrate);
+    if (cfg.baudrate == baudrate) {
+        return;
+    }
 
-	cfg.baudrate = baudrate;
+    old_baudrate = cfg.baudrate;
+    cfg.baudrate = baudrate;
+    atomic_inc(&g_bridge_stats.uart_baud_config_attempts);
+    atomic_set(&g_bridge_stats.uart_baud_last_attempt_ms, k_uptime_get_32());
+    atomic_set(&g_bridge_stats.uart_baud_config_in_progress, 1);
+    err = uart_configure(dev, &cfg);
+    atomic_set(&g_bridge_stats.uart_baud_config_in_progress, 0);
+    if (err) {
+        atomic_inc(&g_bridge_stats.uart_baud_config_failures);
+        LOG_ERR("uart_configure: %d", err);
+        return;
+    }
 
-	err = uart_configure(dev, &cfg);
-	if (err) {
-		LOG_ERR("uart_configure: %d", err);
-		return;
-	}
+    atomic_set(&g_bridge_stats.uart_baud_previous, old_baudrate);
+    atomic_set(&g_bridge_stats.uart_baud_actual, baudrate);
+    atomic_set(&g_bridge_stats.uart_baud_last_change_ms, k_uptime_get_32());
+    atomic_inc(&g_bridge_stats.uart_baud_changes);
 }
 
 static void set_uart_power_state(uint8_t dev_idx, bool active)
@@ -520,6 +555,7 @@ static bool app_event_handler(const struct app_event_header *aeh)
 					return false;
 				}
 				uart_default_baudrate[i] = cfg.baudrate;
+				atomic_set(&g_bridge_stats.uart_baud_actual, cfg.baudrate);
 				subscriber_count[i] = 0;
 				atomic_set(&uart_rx_recovery_pending, 0);
 

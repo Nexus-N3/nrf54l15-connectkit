@@ -75,6 +75,16 @@ static void poll_dtr(void)
 		}
 
 		if (cdc_val != cdc_ready[i] || baudrate != cdc_baudrate[i]) {
+                const uint32_t now_ms = k_uptime_get_32();
+                if (cdc_val != cdc_ready[i]) {
+                    atomic_inc(&g_bridge_stats.cdc_dtr_changes);
+                    atomic_set(&g_bridge_stats.cdc_dtr_last_change_ms, now_ms);
+                }
+                if (baudrate != cdc_baudrate[i]) {
+                    atomic_inc(&g_bridge_stats.cdc_line_baud_changes);
+                    atomic_set(&g_bridge_stats.cdc_line_baud_last_change_ms, now_ms);
+                }
+                atomic_set(&g_bridge_stats.cdc_line_baud, baudrate);
 			struct peer_conn_event *event = new_peer_conn_event();
 
 			event->peer_id = PEER_ID_USB;
