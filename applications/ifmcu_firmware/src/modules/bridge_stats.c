@@ -6,10 +6,129 @@
 #include <zephyr/kernel.h>
 #include <zephyr/shell/shell.h>
 #include "bridge_stats.h"
+#include <zephyr/init.h>
+#include <hal/nrf_timer.h>
 
 struct bridge_stats g_bridge_stats;
 
 #define VALUE(field) ((unsigned int)(uint32_t)atomic_get(&g_bridge_stats.field))
+
+#define BRIDGE_TRACE_CAPACITY 128
+
+struct bridge_trace_entry {
+    uint32_t time_us;
+    uint16_t code;
+    uint16_t value;
+};
+
+static struct bridge_trace_entry trace[BRIDGE_TRACE_CAPACITY];
+static struct k_spinlock trace_lock;
+static uint16_t trace_next;
+static uint16_t trace_count;
+static bool trace_frozen;
+
+/*
+ * Dedicated high-resolution timestamp counter.
+ *
+ * TIMER3: 16 MHz / 2^4 = 1 MHz
+ * Resolution: 1 microsecond
+ * Counter: 32-bit, free-running
+ *
+ * No interrupts, PPI channels or UART configuration changes.
+ */
+static int bridge_trace_timer_init(void)
+{
+    nrf_timer_task_trigger(NRF_TIMER3, NRF_TIMER_TASK_STOP);
+
+    nrf_timer_mode_set(NRF_TIMER3, NRF_TIMER_MODE_TIMER);
+    nrf_timer_bit_width_set(NRF_TIMER3, NRF_TIMER_BIT_WIDTH_32);
+    nrf_timer_prescaler_set(NRF_TIMER3, 4);
+
+    nrf_timer_task_trigger(NRF_TIMER3, NRF_TIMER_TASK_CLEAR);
+    nrf_timer_task_trigger(NRF_TIMER3, NRF_TIMER_TASK_START);
+
+    return 0;
+}
+
+SYS_INIT(bridge_trace_timer_init, POST_KERNEL, 70);
+
+static uint32_t bridge_trace_now_us(void)
+{
+    nrf_timer_task_trigger(NRF_TIMER3, NRF_TIMER_TASK_CAPTURE0);
+    return nrf_timer_cc_get(NRF_TIMER3, NRF_TIMER_CC_CHANNEL0);
+}
+
+void bridge_trace_record(enum bridge_trace_code code, uint16_t value)
+{
+    k_spinlock_key_t key = k_spin_lock(&trace_lock);
+
+    if (!trace_frozen) {
+        struct bridge_trace_entry *entry = &trace[trace_next];
+
+        entry->time_us = bridge_trace_now_us();
+        entry->code = (uint16_t)code;
+        entry->value = value;
+
+        trace_next = (trace_next + 1) % BRIDGE_TRACE_CAPACITY;
+
+        if (trace_count < BRIDGE_TRACE_CAPACITY) {
+            trace_count++;
+        }
+
+        if (code == BRIDGE_TRACE_FRAMING_ERROR) {
+            trace_frozen = true;
+        }
+    }
+
+    k_spin_unlock(&trace_lock, key);
+}
+
+static int cmd_bridge_trace(const struct shell *sh,
+                            size_t argc, char **argv)
+{
+    ARG_UNUSED(argc);
+    ARG_UNUSED(argv);
+
+    k_spinlock_key_t key = k_spin_lock(&trace_lock);
+
+    uint16_t count = trace_count;
+    uint16_t start =
+        (trace_next + BRIDGE_TRACE_CAPACITY - count) %
+        BRIDGE_TRACE_CAPACITY;
+    bool frozen = trace_frozen;
+
+    k_spin_unlock(&trace_lock, key);
+
+    shell_print(sh, "trace frozen=%u count=%u",
+                (unsigned int)frozen, (unsigned int)count);
+
+    if (!frozen) {
+        shell_print(sh, "Waiting for first UART framing error");
+        return 0;
+    }
+
+    uint32_t previous_us = 0;
+
+    for (uint16_t i = 0; i < count; i++) {
+        struct bridge_trace_entry entry =
+            trace[(start + i) % BRIDGE_TRACE_CAPACITY];
+
+        uint32_t delta = (i == 0) ?
+            0 : entry.time_us - previous_us;
+
+        shell_print(sh,
+                    "trace idx=%u time_us=%u delta_us=%u event=%u value=%u",
+                    (unsigned int)i,
+                    entry.time_us,
+                    delta,
+                    (unsigned int)entry.code,
+                    (unsigned int)entry.value);
+
+        previous_us = entry.time_us;
+    }
+
+    return 0;
+}
 
 static int cmd_bridge_stats(const struct shell *sh, size_t argc, char **argv)
 {
@@ -71,6 +190,7 @@ static int cmd_bridge_stats(const struct shell *sh, size_t argc, char **argv)
 
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_bridge,
     SHELL_CMD(stats, NULL, "Show USB/UART bridge counters", cmd_bridge_stats),
+    SHELL_CMD(trace, NULL, "Show frozen UART event trace", cmd_bridge_trace),
     SHELL_SUBCMD_SET_END
 );
 SHELL_CMD_REGISTER(bridge, &sub_bridge, "USB/UART bridge diagnostics", NULL);

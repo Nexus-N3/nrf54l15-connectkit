@@ -11,6 +11,11 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 find_package(Git)
 project(IFMCU)
 
+# Make the IFMCU diagnostic trace available to the Zephyr UART driver
+zephyr_include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/modules
+)
+
 # NORDIC SDK APP START
 target_sources(app PRIVATE 
   src/main.c

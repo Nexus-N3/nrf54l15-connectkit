@@ -7,6 +7,18 @@
 #define IFMCU_BRIDGE_STATS_H_
 
 #include <zephyr/sys/atomic.h>
+#include <stdint.h>
+
+enum bridge_trace_code {
+    BRIDGE_TRACE_TIMEOUT_STOPRX = 1,
+    BRIDGE_TRACE_RXSTARTED,
+    BRIDGE_TRACE_ENDRX,
+    BRIDGE_TRACE_RXTO,
+    BRIDGE_TRACE_UART_ERROR,
+    BRIDGE_TRACE_FRAMING_ERROR,
+};
+
+void bridge_trace_record(enum bridge_trace_code code, uint16_t value);
 
 struct bridge_stats {
     atomic_t uart_rx_events;

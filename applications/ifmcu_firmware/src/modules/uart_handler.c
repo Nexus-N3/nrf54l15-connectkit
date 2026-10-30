@@ -34,7 +34,7 @@ static const struct device *devices[] = {
 #define UART_SLAB_BLOCK_SIZE sizeof(struct uart_rx_buf)
 #define UART_SLAB_BLOCK_COUNT (UART_DEVICE_COUNT * CONFIG_IFMCU_UART_BUF_COUNT)
 #define UART_SLAB_ALIGNMENT 4
-#define UART_RX_TIMEOUT_USEC 5000
+#define UART_RX_TIMEOUT_USEC 2000
 #define UART_RX_RECOVERY_DELAY_MS 25
 /* This IFMCU firmware defines a single physical UART bridge. */
 BUILD_ASSERT(UART_DEVICE_COUNT == 1, "Recovery work is single-UART");
